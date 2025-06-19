@@ -1,0 +1,30 @@
+Starting capture on switch-eth0
+Starting capture on switch-eth1
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001
+Forwarding packet to IP: 10.0.0.2, packet length is 74
+Checking rule: 10.0.0.1, switch-eth0
+Checking rule: 10.0.0.2, switch-eth1
+Packet src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=20001 dst_port=30001

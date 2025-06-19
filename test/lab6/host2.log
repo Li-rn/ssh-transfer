@@ -1,0 +1,5 @@
+Running server...
+set up server_addr 10.0.0.2:30001
+set up socket 3 option MSS 1024
+Server: done with bind to 10.0.0.2:30001
+done with listen on 10.0.0.2:30001
