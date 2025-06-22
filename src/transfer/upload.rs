@@ -11,7 +11,8 @@ use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use walkdir::WalkDir;
+use std::future::Future;
+use std::pin::Pin;
 
 pub struct Uploader {
     session: SshSession,
@@ -132,8 +133,7 @@ impl Uploader {
                         .ok_or_else(|| anyhow::anyhow!("Cannot determine file name"))?
                         .to_string_lossy();
                     Ok(format!("{}/{}", remote_path.trim_end_matches('/'), file_name))
-                } else {
-                    // 如果是文件，直接使用
+                } else {// 如果是文件，直接使用
                     Ok(remote_path.to_string())
                 }
             }
@@ -226,75 +226,120 @@ impl Uploader {
         Ok(())
     }
 
-    async fn upload_directory(&self, sftp: &Sftp, local_dir: &Path, remote_dir: &str) -> Result<()> {
-        // 确保远程目录存在
-        self.ensure_remote_directory(sftp, Path::new(remote_dir))?;
-
-        // 收集要上传的文件
-        let files: Vec<_> = WalkDir::new(local_dir)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-            .collect();
-
-        let total_size: u64 = files.iter()
-            .map(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
-            .sum();
-
-        let progress = Arc::new(ProgressTracker::new(total_size, "Uploading files"));
-
-        // 创建上传任务
-        let (tx, rx): (Sender<UploadTask>, Receiver<UploadTask>) = bounded(100);
-
-        // 启动工作线程
-        let mut handles = Vec::new();
-        for _ in 0..self.config.threads {
-            let rx = rx.clone();
-            let session = self.session.clone_session()?;
-            let config = Arc::clone(&self.config);
-            let progress = Arc::clone(&progress);
-
-            let handle = thread::spawn(move || {
-                let sftp = session.sftp().unwrap();
-                while let Ok(task) = rx.recv() {
-                    if let Err(e) = Self::upload_file_worker(&sftp, &task, &config) {
-                        eprintln!("Upload error for {}: {}", task.local_path.display(), e);
-                    } else {
-                        progress.add_bytes(task.size);
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        // 发送上传任务
-        for entry in files {
-            let local_file_path = entry.path();
-            let relative_path = local_file_path.strip_prefix(local_dir)?;
-            let remote_file_path = format!("{}/{}", remote_dir.trim_end_matches('/'), relative_path.to_string_lossy());
-
+    // 使用Pin<Box<dyn Future>> 返回类型来处理异步递归
+    fn upload_directory<'a>(
+        &'a self, 
+        sftp: &'a Sftp, 
+        local_dir: &'a Path, 
+        remote_dir: &'a str
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
             // 确保远程目录存在
-            if let Some(parent) = Path::new(&remote_file_path).parent() {
-                self.ensure_remote_directory(sftp, parent)?;
+            self.ensure_remote_directory(sftp, Path::new(remote_dir))?;
+
+            // 收集要上传的文件和子目录
+            let mut files_to_upload = Vec::new();
+            let mut dirs_to_upload = Vec::new();
+            let mut total_size: u64 = 0;
+
+            // 使用std::fs::read_dir收集文件但不立即递归处理子目录
+            for entry in std::fs::read_dir(local_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), file_name);
+
+                if path.is_dir() {
+                    // 收集子目录，稍后处理
+                    dirs_to_upload.push((path.to_path_buf(), remote_path));
+                } else if path.is_file() {
+                    // 添加文件到上传列表
+                    let metadata = std::fs::metadata(&path)?;
+                    let size = metadata.len();
+                    
+                    // 如果启用断点续传，检查远程文件
+                    let mut effective_size = size;
+                    let mut offset = 0;
+                    if self.config.resume {
+                        match sftp.stat(Path::new(&remote_path)) {
+                            Ok(stat) => {
+                                let remote_size = stat.size.unwrap_or(0);
+                                if remote_size < size {
+                                    // 只上传剩余部分
+                                    offset = remote_size;
+                                    effective_size = size - remote_size;
+                                } else if remote_size == size {
+                                    // 文件已完成，跳过
+                                    println!("Skipping already uploaded file: {}", path.display());
+                                    continue;
+                                }
+                            }
+                            Err(_) => {} // 文件不存在，从头开始上传
+                        }
+                    }
+                    
+                    total_size += effective_size;
+                    files_to_upload.push((path, remote_path, offset, effective_size));
+                }
             }
 
-            let size = entry.metadata()?.len();
-            let task = UploadTask {
-                local_path: local_file_path.to_path_buf(),
-                remote_path: remote_file_path,
-                size,
-            };
-            tx.send(task)?;
-        }
-        drop(tx);
+            // 为当前目录创建单个总进度条
+            let progress = Arc::new(ProgressTracker::new(
+                total_size, 
+                &format!("Uploading from {}", local_dir.display())
+            ));
 
-        // 等待所有工作线程完成
-        for handle in handles {
-            handle.join().map_err(|_| TransferError::ThreadJoinError)?;
-        }
+            // 创建上传任务
+            let (tx, rx): (Sender<UploadTask>, Receiver<UploadTask>) = bounded(100);
 
-        progress.finish();
-        Ok(())
+            // 启动工作线程
+            let mut handles = Vec::new();
+            for _ in 0..self.config.threads {
+                let rx = rx.clone();
+                let session = self.session.clone_session()?;
+                let config = Arc::clone(&self.config);
+                let progress = Arc::clone(&progress);
+
+                let handle = thread::spawn(move || {
+                    let sftp = session.sftp().unwrap();
+                    while let Ok(task) = rx.recv() {
+                        if let Err(e) = Self::upload_file_worker(&sftp, &task, &config) {
+                            eprintln!("Upload error for {}: {}", task.local_path.display(), e);
+                        } else {
+                            progress.add_bytes(task.effective_size);
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            // 发送上传任务
+            for (local_path, remote_path, offset, effective_size) in files_to_upload {
+                let task = UploadTask {
+                    local_path,
+                    remote_path,
+                    offset,
+                    effective_size,
+                };
+                tx.send(task)?;
+            }
+            drop(tx);
+
+            // 等待所有工作线程完成
+            for handle in handles {
+                handle.join().map_err(|_| TransferError::ThreadJoinError)?;
+            }
+
+            progress.finish();
+            
+            // 当前目录处理完毕后，顺序处理子目录
+            // 这样避免同时创建太多进度条
+            for (local_subdir, remote_subdir) in dirs_to_upload {
+                self.upload_directory(sftp, &local_subdir, &remote_subdir).await?;
+            }
+
+            Ok(())
+        })
     }
 
     async fn upload_file(&self, sftp: &Sftp, local_path: &Path, remote_path: &str) -> Result<()> {
@@ -386,23 +431,13 @@ impl Uploader {
     fn upload_file_worker(sftp: &Sftp, task: &UploadTask, config: &Config) -> Result<()> {
         let mut local_file = File::open(&task.local_path)?;
         
-        // 检查是否可以断点续传
-        let mut offset = 0;
-        if config.resume {
-            match sftp.stat(Path::new(&task.remote_path)) {
-                Ok(stat) => {
-                    let remote_size = stat.size.unwrap_or(0);
-                    if remote_size > 0 && remote_size < task.size {
-                        offset = remote_size;
-                        local_file.seek(SeekFrom::Start(offset))?;
-                    }
-                }
-                Err(_) => {} // 文件不存在，从头开始
-            }
+        // 设置偏移量
+        if task.offset > 0 {
+            local_file.seek(SeekFrom::Start(task.offset))?;
         }
         
         // 创建或打开远程文件
-        let mut remote_file = if offset > 0 {
+        let mut remote_file = if task.offset > 0 {
             sftp.open_mode(
                 Path::new(&task.remote_path),
                 ssh2::OpenFlags::WRITE | ssh2::OpenFlags::APPEND,
@@ -410,21 +445,58 @@ impl Uploader {
                 OpenType::File
             )?
         } else {
+            // 确保父目录存在
+            if let Some(parent) = Path::new(&task.remote_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    match sftp.stat(parent) {
+                        Ok(stat) if stat.is_dir() => {}, // 目录已存在
+                        _ => {
+                            // 尝试创建目录
+                            sftp.mkdir(parent, 0o755).ok();
+                        }
+                    }
+                }
+            }
             sftp.create(Path::new(&task.remote_path))?
         };
-
-        let mut buffer = vec![0u8; config.chunk_size];
+    
+        // 对于大文件使用更大的缓冲区
+        let buffer_size = if task.effective_size > 10 * 1024 * 1024 {
+            // 大文件使用8MB缓冲区
+            8 * 1024 * 1024
+        } else {
+            config.chunk_size
+        };
+        
+        let mut buffer = vec![0u8; buffer_size];
+        
+        // 添加进度反馈
+        let mut bytes_uploaded = 0;
+        let update_frequency = if task.effective_size > 10 * 1024 * 1024 {
+            // 大文件每1MB反馈一次
+            1024 * 1024
+        } else {
+            // 小文件每128KB反馈一次
+            128 * 1024
+        };
         
         loop {
             match local_file.read(&mut buffer) {
                 Ok(0) => break, // EOF
                 Ok(bytes_read) => {
                     remote_file.write_all(&buffer[..bytes_read])?;
+                    bytes_uploaded += bytes_read as u64;
+                    
+                    // 减少进度更新频率
+                    if bytes_uploaded >= update_frequency {
+                        // 我们不在这里更新进度，而是返回后一次性更新
+                        bytes_uploaded = 0;
+                    }
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-
+    
         // 确保数据写入完成
         remote_file.fsync().ok();
         Ok(())
@@ -435,5 +507,6 @@ impl Uploader {
 struct UploadTask {
     local_path: PathBuf,
     remote_path: String,
-    size: u64,
+    offset: u64,         // 断点续传的起始位置
+    effective_size: u64,  // 实际需要上传的大小
 }

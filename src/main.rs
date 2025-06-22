@@ -14,13 +14,13 @@ async fn main() -> Result<()> {
     println!("Target: {}@{}:{}", cli.username, cli.host, cli.port);
     
     let config = Config::from_cli(&cli)?;
-    
+
     match run_transfer(config).await {
         Ok(_) => {
-            println!("✅ Transfer completed successfully!");
+            println!("\n✅ Transfer completed successfully!\n");
         }
         Err(e) => {
-            eprintln!("❌ Transfer failed: {}", e);
+            eprintln!("\n❌ Transfer failed: {}\n", e);
             std::process::exit(1);
         }
     }

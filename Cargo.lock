@@ -773,6 +773,7 @@ dependencies = [
  "indicatif",
  "log",
  "md5",
+ "once_cell",
  "rayon",
  "rpassword",
  "serde",

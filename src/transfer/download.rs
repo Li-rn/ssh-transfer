@@ -11,6 +11,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::future::Future;
 use std::pin::Pin;
 
 pub struct Downloader {
@@ -49,7 +50,7 @@ impl Downloader {
             }
         }
         
-        // 回退到标准Linux路径
+        // 回退到标准Linuxpath
         let default_home = format!("/home/{}", username);
         println!("Using default remote home directory: {}", default_home);
         Ok(default_home)
@@ -153,10 +154,10 @@ impl Downloader {
 
         // 断点续传逻辑：检查本地文件是否存在
         let mut offset = 0;
-        let progress = ProgressTracker::new(file_size, &format!("Downloading {}", remote_path));
+        let progress = ProgressTracker::new(file_size, &format!("Downloading {}", Path::new(remote_path).file_name().unwrap_or_default().to_string_lossy()));
         
         if self.config.resume && local_path.exists() {
-            // 获取本地文件大小
+            // 获取本地本文件大小
             let metadata = std::fs::metadata(local_path)?;
             let local_size = metadata.len();
             
@@ -216,122 +217,136 @@ impl Downloader {
         Ok(())
     }
 
-    async fn download_directory(&self, sftp: &Sftp, remote_dir: &str, local_dir: &Path) -> Result<()> {
-        // 确保本地目录存在
-        if !local_dir.exists() {
-            std::fs::create_dir_all(local_dir)?;
-        } else if !local_dir.is_dir() {
-            return Err(anyhow::anyhow!("Local path exists but is not a directory: {}", local_dir.display()));
-        }
+    // 使用Pin<Box<dyn Future>> 返回类型来处理异步递归
+    fn download_directory<'a>(
+        &'a self,
+        sftp: &'a Sftp,
+        remote_dir: &'a str,
+        local_dir: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            // 确保本地目录存在
+            if !local_dir.exists() {
+                std::fs::create_dir_all(local_dir)?;
+            } else if !local_dir.is_dir() {
+                return Err(anyhow::anyhow!("Local path exists but is not a directory: {}", local_dir.display()));
+            }
 
-        // 获取远程目录内容
-        let entries = sftp.readdir(Path::new(remote_dir))?;
-        
-        // 计算总下载大小
-        let mut total_size = 0u64;
-        let mut files_to_download = Vec::new();
-        
-        for (path, stat) in entries {
-            let path_str = path.to_string_lossy().to_string();
-            let file_name = path.file_name()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine file name"))?
-                .to_string_lossy().to_string();
-            let local_path = local_dir.join(&file_name);
+            // 获取远程目录内容
+            let entries = sftp.readdir(Path::new(remote_dir))?;
             
-            if stat.is_dir() {
-                // 递归处理子目录 - 用 Box::pin 包装异步调用
-                let remote_subdir = format!("{}/{}", remote_dir, file_name);
-                // 创建目标子目录
-                let file_name = Path::new(&remote_subdir)
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("Cannot determine directory name from remote path"))?;
-                let new_local_path = local_path.join(file_name);
-                let future = self.download_directory(sftp, &remote_subdir, &new_local_path);
-                Pin::from(Box::new(future)).await?;
-            } else {
-                // 添加文件到下载列表
-                let size = stat.size.unwrap_or(0);
+            // 计算总下载大小和收集文件信息
+            let mut total_size = 0u64;
+            let mut files_to_download = Vec::new();
+            let mut dirs_to_download = Vec::new();
+            
+            for (path, stat) in entries {
+                let path_str = path.to_string_lossy().to_string();
+                let file_name = path.file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Cannot determine file name"))?
+                    .to_string_lossy().to_string();
+                let local_path = local_dir.join(&file_name);
                 
-                // 如果启用断点续传，检查本地文件
+                if stat.is_dir() {
+                    // 收集子目录信息，稍后处理
+                    let remote_subdir = format!("{}/{}", remote_dir, file_name);
+                    dirs_to_download.push((remote_subdir, local_path));
+                } else {
+                    // 添加文件到下载列表
+                    let size = stat.size.unwrap_or(0);
+                    
+                    // 如果启用断点续传，检查本地文件
+                    let mut effective_size = size;
+                    if self.config.resume && local_path.exists() {
+                        if let Ok(metadata) = std::fs::metadata(&local_path) {
+                            let local_size = metadata.len();
+                            if local_size < size {
+                                // 只下载剩余部分
+                                effective_size = size - local_size;
+                            } else if local_size == size {
+                                // 文件已完成，跳过
+                                println!("Skipping already downloaded file: {}", local_path.display());
+                                continue;
+                            }
+                        }
+                    }
+                    
+                    total_size += effective_size;
+                    files_to_download.push((path_str, local_path, size));
+                }
+            }
+
+            // 创建单个总进度条跟踪当前目录的所有文件
+            let progress = Arc::new(ProgressTracker::new(
+                total_size, 
+                &format!("Downloading from {}", remote_dir)
+            ));
+
+            // 创建下载任务
+            let (tx, rx): (Sender<DownloadTask>, Receiver<DownloadTask>) = bounded(100);
+
+            // 启动工作线程
+            let mut handles = Vec::new();
+            for _ in 0..self.config.threads {
+                let rx = rx.clone();
+                let session = self.session.clone_session()?;
+                let config = Arc::clone(&self.config);
+                let progress = Arc::clone(&progress);
+
+                let handle = thread::spawn(move || {
+                    let sftp = session.sftp().unwrap();
+                    while let Ok(task) = rx.recv() {
+                        if let Err(e) = Self::download_file_worker(&sftp, &task, &config) {
+                            eprintln!("Download error for {}: {}", task.remote_path, e);
+                        } else {
+                            progress.add_bytes(task.effective_size);
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            // 发送下载任务
+            for (remote_path, local_path, size) in files_to_download {
+                let mut offset = 0;
                 let mut effective_size = size;
+                
+                // 如果启用断点续传，计算偏移量
                 if self.config.resume && local_path.exists() {
                     if let Ok(metadata) = std::fs::metadata(&local_path) {
                         let local_size = metadata.len();
                         if local_size < size {
-                            // 只下载剩余部分
+                            offset = local_size;
                             effective_size = size - local_size;
-                        } else if local_size == size {
-                            // 文件已完成，跳过
-                            println!("Skipping already downloaded file: {}", local_path.display());
-                            continue;
                         }
                     }
                 }
                 
-                total_size += effective_size;
-                files_to_download.push((path_str, local_path, size));
+                let task = DownloadTask {
+                    remote_path,
+                    local_path,
+                    offset,
+                    effective_size,
+                };
+                tx.send(task)?;
             }
-        }
+            drop(tx);
 
-        let progress = Arc::new(ProgressTracker::new(total_size, "Downloading files"));
-
-        // 创建下载任务
-        let (tx, rx): (Sender<DownloadTask>, Receiver<DownloadTask>) = bounded(100);
-
-        // 启动工作线程
-        let mut handles = Vec::new();
-        for _ in 0..self.config.threads {
-            let rx = rx.clone();
-            let session = self.session.clone_session()?;
-            let config = Arc::clone(&self.config);
-            let progress = Arc::clone(&progress);
-
-            let handle = thread::spawn(move || {
-                let sftp = session.sftp().unwrap();
-                while let Ok(task) = rx.recv() {
-                    if let Err(e) = Self::download_file_worker(&sftp, &task, &config) {
-                        eprintln!("Download error for {}: {}", task.remote_path, e);
-                    } else {
-                        progress.add_bytes(task.effective_size);
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        // 发送下载任务
-        for (remote_path, local_path, size) in files_to_download {
-            let mut offset = 0;
-            let mut effective_size = size;
-            
-            // 如果启用断点续传，计算偏移量
-            if self.config.resume && local_path.exists() {
-                if let Ok(metadata) = std::fs::metadata(&local_path) {
-                    let local_size = metadata.len();
-                    if local_size < size {
-                        offset = local_size;
-                        effective_size = size - local_size;
-                    }
-                }
+            // 等待所有工作线程完成
+            for handle in handles {
+                handle.join().map_err(|_| TransferError::ThreadJoinError)?;
             }
+
+            progress.finish();
             
-            let task = DownloadTask {
-                remote_path,
-                local_path,
-                offset,
-                effective_size,
-            };
-            tx.send(task)?;
-        }
-        drop(tx);
+            // 处理完当前目录中的文件后，顺序处理子目录
+            // 这样避免同时创建太多进度条
+            for (remote_subdir, local_subpath) in dirs_to_download {
+                self.download_directory(sftp, &remote_subdir, &local_subpath).await?;
+            }
 
-        // 等待所有工作线程完成
-        for handle in handles {
-            handle.join().map_err(|_| TransferError::ThreadJoinError)?;
-        }
-
-        progress.finish();
-        Ok(())
+            Ok(())
+        })
     }
 
     fn download_file_worker(sftp: &Sftp, task: &DownloadTask, config: &Config) -> Result<()> {
@@ -342,6 +357,12 @@ impl Downloader {
                 .append(true)
                 .open(&task.local_path)?
         } else {
+            // 确保父目录存在
+            if let Some(parent) = task.local_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
             File::create(&task.local_path)?
         };
         
@@ -350,24 +371,48 @@ impl Downloader {
         if task.offset > 0 {
             remote_file.seek(SeekFrom::Start(task.offset))?;
         }
-
-        let mut buffer = vec![0u8; config.chunk_size];
+    
+        // 对于大文件使用更大的缓冲区
+        let buffer_size = if task.effective_size > 10 * 1024 * 1024 {
+            // 大文件使用8MB缓冲区
+            8 * 1024 * 1024
+        } else {
+            config.chunk_size
+        };
+        
+        let mut buffer = vec![0u8; buffer_size];
+        
+        // 添加进度反馈
+        let mut bytes_downloaded = 0;
+        let update_frequency = if task.effective_size > 10 * 1024 * 1024 {
+            // 大文件每1MB反馈一次
+            1024 * 1024
+        } else {
+            // 小文件每128KB反馈一次
+            128 * 1024
+        };
         
         loop {
             match remote_file.read(&mut buffer) {
                 Ok(0) => break, // EOF
                 Ok(bytes_read) => {
                     local_file.write_all(&buffer[..bytes_read])?;
+                    bytes_downloaded += bytes_read as u64;
+                    
+                    // 减少进度更新频率
+                    if bytes_downloaded >= update_frequency {
+                        // 我们不在这里更新进度，而是返回后一次性更新
+                        bytes_downloaded = 0;
+                    }
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-
+    
+        // 确保数据写入磁盘
         local_file.flush()?;
         Ok(())
     }
-
-    // 删除未使用的方法和结构体
 }
 
 #[derive(Debug)]

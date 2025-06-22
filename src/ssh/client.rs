@@ -12,7 +12,7 @@ pub struct SshClient {
 
 impl SshClient {
     pub fn connect(config: &Config) -> Result<Self> {
-        println!("Connecting to {}:{}...", config.host, config.port);
+        // println!("Connecting to {}:{}...", config.host, config.port);
         
         let tcp = TcpStream::connect(format!("{}:{}", config.host, config.port))
             .context("Failed to connect to SSH server")?;
@@ -21,24 +21,24 @@ impl SshClient {
         session.set_tcp_stream(tcp);
         session.handshake().context("SSH handshake failed")?;
 
-        println!("SSH handshake completed. Authenticating...");
+        // println!("SSH handshake completed. Authenticating...");
 
         // Authentication
         match &config.auth {
             AuthMethod::Password(password) => {
-                println!("Authenticating with password...");
+                // println!("Authenticating with password...");
                 session
                     .userauth_password(&config.username, password)
                     .context("Password authentication failed")?;
             }
             AuthMethod::PublicKey(key_path) => {
-                println!("Authenticating with SSH key: {}", key_path.display());
+                // println!("Authenticating with SSH key: {}", key_path.display());
                 session
                     .userauth_pubkey_file(&config.username, None, key_path, None)
                     .context("Public key authentication failed")?;
             }
             AuthMethod::Agent => {
-                println!("Authenticating with SSH agent...");
+                // println!("Authenticating with SSH agent...");
                 session
                     .userauth_agent(&config.username)
                     .context("SSH agent authentication failed")?;
@@ -49,7 +49,7 @@ impl SshClient {
             return Err(TransferError::AuthenticationFailed.into());
         }
 
-        println!("Authentication successful!");
+        // println!("Authentication successful!");
         Ok(SshClient { session })
     }
 
