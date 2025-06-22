@@ -13,7 +13,8 @@ A high-performance, multi-threaded SSH file transfer tool with resume capability
 
 ## Environment
 
-**安装 Rust 工具链：**
+**安装 Rust 工具链**
+
 macOS/Linux：
 
 ```bash
@@ -39,7 +40,9 @@ cargo build --release
 **Commands:**
 
   **download**  Download files from remote server
+
   **upload**    Upload files to remote server
+
   **help**      Print this message or the help of the given subcommand(s)
 
 **Options:**
